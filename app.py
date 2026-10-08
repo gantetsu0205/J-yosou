@@ -1,17 +1,13 @@
 import math
 import re
 import unicodedata
+import urllib.parse
+import urllib.request
 import datetime as dt
+from html.parser import HTMLParser
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-try:
-    import requests
-    from bs4 import BeautifulSoup
-except ImportError:
-    requests = None
-    BeautifulSoup = None
 
 st.set_page_config(page_title="Jリーグ勝敗予想", page_icon="⚽", layout="wide")
 
@@ -35,18 +31,44 @@ DUMMY_TEAMS = {
 # ---------- データ取得（Jリーグデータサイト） ----------
 def norm(s):
     """全角英数を半角に統一（例: 第１節→第1節, Ｃ大阪→C大阪）"""
-    return unicodedata.normalize("NFKC", s).strip()
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", s))
+
+
+class _TableParser(HTMLParser):
+    """標準ライブラリだけで <tr><td> の文字を集める（追加インストール不要）"""
+
+    def __init__(self):
+        super().__init__()
+        self.rows, self._row, self._cell = [], None, None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._row = []
+        elif tag == "td" and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag):
+        if tag == "td" and self._cell is not None and self._row is not None:
+            self._row.append("".join(self._cell))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
 
 
 def parse_table(html, cat):
     """日程・結果テーブルを解析。列: シーズン,大会,節,試合日,K/O,ホーム,スコア,アウェイ,スタジアム,入場者,放送"""
-    soup = BeautifulSoup(html, "html.parser")
+    parser = _TableParser()
+    parser.feed(html)
     rows = []
-    for tr in soup.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 8:
+    for cells in parser.rows:
+        if len(cells) < 8:
             continue
-        t = [norm(td.get_text(strip=True)) for td in tds]
+        t = [norm(c) for c in cells]
         m_round = re.search(r"第(\d+)節", t[2])
         m_date = re.search(r"(\d{2})/(\d{2})/(\d{2})", t[3])
         if not (m_round and m_date) or not t[1].startswith(cat):
@@ -60,13 +82,12 @@ def parse_table(html, cat):
 
 
 def fetch_category(cat):
-    if requests is None or BeautifulSoup is None:
-        raise RuntimeError("requests / beautifulsoup4 が未インストール")
-    r = requests.get(BASE_URL, params={"competition_years": SEASON, "competition_frame_ids": FRAME[cat]},
-                     headers={"User-Agent": "Mozilla/5.0 (jleague-yosou-app)"}, timeout=20)
-    r.raise_for_status()
-    r.encoding = "utf-8"
-    df = parse_table(r.text, cat)
+    url = BASE_URL + "?" + urllib.parse.urlencode(
+        {"competition_years": SEASON, "competition_frame_ids": FRAME[cat]})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (jleague-yosou-app)"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+    df = parse_table(html, cat)
     if len(df) < 100:  # 38節×10試合=380試合が通常。極端に少なければ構造変更とみなす
         raise RuntimeError(f"試合数が想定より少ない: {len(df)}")
     return df
